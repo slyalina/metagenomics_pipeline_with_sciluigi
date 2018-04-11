@@ -261,30 +261,30 @@ class TrimReads(sl.Task, AutoPairedFastq):
 
 
 class CreateIndexForContamRemoval(sl.Task, AutoSentinel):
-    # TODO: Figure out how to track if ref has been indexed before
-
 
     def run(self):
         method = self.workflow_task.contaminant_removal_method
         output = self.out_put()
         outdir = os.path.dirname(output)
+        # Location of either existing ref data with subdirs per method. Must have trailing slash:
+        ref_dir_for_wf = os.path.join(self.workflow_task.ref_info_subdir, self.workflow_task.ref_combo_hash, method, "")
 
         # If the given ref dir has necessary indices, just symlink them to the local dir
-        # Else make them
-        if method == "bbsplit":
-            for genome in self.genomes:
-                label = genome.split("/")[-1].split(".")[0]  # Do this more robustly
-                self.ex("bbsplit.sh ref={genome} path={path} -Xmx16g".format(
-                    genome=genome,
-                    path=outdir
-                ))
-        elif method == "bowtie2":
-
-            self.ex("cat {seqs} > /tmp/combo.fa;"
-                    "bowtie2-build tmp/combo.fa ref".format(
-                seqs=" ".join(self.workflow_task.filter_genomes)
-            ))
-
+        if not os.path.exists(ref_dir_for_wf):
+            output.target.fs.mkdir(ref_dir_for_wf)
+             # Else make them
+            if method == "bbsplit":
+                    self.ex("bbsplit.sh ref={genome} path={path}".format(
+                        genome=",".join(self.workflow_task.filter_genomes),
+                        path=ref_dir_for_wf
+                    ))
+            elif method == "bowtie2":
+                self.ex("bowtie2-build {genome} {path}".format(
+                            genome=",".join(self.workflow_task.filter_genomes),
+                            path=ref_dir_for_wf)
+                )
+        os.symlink(os.path.join(self.workflow_task.ref_info_subdir, self.workflow_task.ref_combo_hash),
+                   outdir, target_is_directory=True)
         with output.open("w") as fp:
             self.log_info(fp)
 
@@ -293,27 +293,30 @@ class ContaminantRemoval(sl.Task, AutoPairedFastq, AutoTxt):
     # TODO: finish implementing dependency on index being made beforehand
     in_fastq1 = None
     in_fastq2 = None
-    ref = None  # Ref has to handle both bt2 and bbsplit index
+    ref = None # Ref is the sentinel file that lives in the dir created via symlink pointing at ref dirs for each method
 
     def run(self):
-        ref_dir = os.path.dirname(self.ref().path)
         method = self.workflow_task.self.workflow_task.contaminant_removal_method
+        ref_dir = os.path.join(os.path.dirname(self.ref().path), method, "") # Again have to ensure trailing slash
         outtxt = self.out_put()
         outdir = os.path.dirname(self.out_fastq1().path)
 
         if method == "bowtie2":
             self.ex("bowtie2 -x {ref} -1 {reads1} -2 {reads2} \
-                --un-conc-gz \
-                {out}/tmp%.fq.gz > /dev/null 2>{log};"
-                    "mv {out}/tmp1.fq.gz {out1}".format(
-                reads1=self.in_fastq1().path,
-                reads2=self.in_fastq2().path,
-                out=outdir,
-                ref=self.ref,
-                log=outtxt.path,
-                sample=self.workflow_task.prefix
-
+                    --un-conc-gz \
+                    {out}/tmp%.fq.gz > /dev/null 2>{log};"
+                    "mv {out}/tmp1.fq.gz {out1};"
+                    "mv {out}/tmp1.fq.gz {out2}".format(
+                    reads1=self.in_fastq1().path,
+                    reads2=self.in_fastq2().path,
+                    out=outdir,
+                    ref=ref_dir,
+                    out1=self.out_fastq1(),
+                    out2=self.out_fastq2(),
+                    log=outtxt.path,
+                    sample=self.workflow_task.prefix
             ))
+
         elif method == "bbsplit":
 
             self.ex('''
@@ -322,7 +325,7 @@ class ContaminantRemoval(sl.Task, AutoPairedFastq, AutoTxt):
                 in2={reads2} \
                 outu={out1} \
                 outu2={out2} \
-                statsfile={logs}/{sample}/bbsplit_decontamination.log \
+                statsfile={log} \
                 minid=0.95 maxindel=3 bwr=0.16 bw=12 quickmatch \
                 fast minhits=2 qtrim=rl trimq=10 untrim -Xmx140g \
                 path={path}
@@ -331,9 +334,8 @@ class ContaminantRemoval(sl.Task, AutoPairedFastq, AutoTxt):
                 reads2=self.in_fastq2().path,
                 out1=self.out_fastq1().path,
                 out2=self.out_fastq2().path,
-                path=os.path.basename(self.ref().path),
-                logs=os.path.join(self.workflow_task.workdir, self.workflow_task.tool_log_subdir),
-                sample=self.workflow_task.prefix
+                path=ref_dir,
+                log=outtxt.path,
             )
             )
         else:
