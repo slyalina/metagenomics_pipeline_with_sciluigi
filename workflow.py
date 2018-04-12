@@ -1,7 +1,18 @@
+# coding=utf-8
 """
 A basic metagenomics workflow using SciLuigi.
 
-Usage: workflow.py <working_dir> <prefix> [--mpa_dir=<path> --midas_dir=<midas_db_path>]
+Usage: workflow.py <working_dir> <prefix>
+    [--midas_db=<midas_db_path>] [--ref_data_dir=<ref_dir>] [--genome_to_filter=<human.fa>]...
+
+
+Options:
+--midas_db=<midas_db_path>     Location of the MIDAS database
+--ref_data_dir=<ref_dir>       Location of where precomputed indices for filtering may exist.
+                               If they don't, they'll be created
+--genome_to_filter=<human.fa>  Can be specified multiple times to filter against multiple fastas
+
+
 """
 
 import hashlib
@@ -36,6 +47,11 @@ def get_md5(filepath):
                 break
             md5.update(data)
     return md5.hexdigest()
+
+
+def get_md5_of_unordered_fileset(list_of_filepaths):
+    hashes = [get_md5(filepath) for filepath in list_of_filepaths]
+    return hashlib.md5(";".join(sorted(hashes)).encode('utf-8')).hexdigest()
 
 
 class AutoOutput(object):
@@ -76,9 +92,9 @@ class AutoOutput(object):
             json.dumps(description, sort_keys=True).encode('utf-8')).hexdigest()
 
         # generate out_put path automatically
-        TEMPLATE = '{workdir}/{workflow_name}/{instance_name}/{digest}'
+        template = '{workdir}/{workflow_name}/{instance_name}/{digest}'
 
-        output_path = TEMPLATE.format(
+        output_path = template.format(
             workdir=workdir,
             instance_name=self.instance_name,
             workflow_name=self.workflow_task.__class__.__name__,
@@ -133,15 +149,14 @@ class AutoPairedFastq(AutoOutput):
 
 
 class SingleSampleWorkflow(sl.WorkflowTask):
+    midas_db = sl.Parameter()
     workdir = sl.Parameter()
     prefix = sl.Parameter()
     tool_log_subdir = sl.Parameter(default="tool_logs")
     contaminant_removal_method = sl.Parameter(default="bbsplit")
-    filter_genomes = luigi.ListParameter(default=["/Users/ipqb/Downloads/GCF_000195995.1_ASM19599v1_genomic.fna.gz",
-                                           "/Users/ipqb/Downloads/GCF_000005845.2_ASM584v2_genomic.fna.gz"])
-    ref_info_subdir = sl.Parameter(default=os.path.join(workdir, "ref_data"))
-    genome_hashes = {genome_file: get_md5(genome_file) for genome_file in filter_genomes}
-    ref_combo_hash = hashlib.md5(";".join(sorted(genome_hashes.values())).encode('utf-8')).hexdigest()
+    filter_genomes = luigi.ListParameter()
+    ref_info_dir = sl.Parameter()
+    ref_combo_hash = sl.Parameter()
 
     # genomes = luigi.ListParameter(default=[
     #             "/pollard/home/slyalina/work/reference/masked_genomes_for_filtering/cat_masked.fa.gz",
@@ -151,6 +166,7 @@ class SingleSampleWorkflow(sl.WorkflowTask):
 
 
     def workflow(self):
+
         # Initialize tasks:
         input_task = self.new_task("input", Input,
                                    prefix=self.prefix)
@@ -161,8 +177,9 @@ class SingleSampleWorkflow(sl.WorkflowTask):
         metaphlan_task = self.new_task("metaphlan", RunMetaphlan2)
         midas_task = self.new_task("midas_species", RunMIDAS,
                                    midas_subtask="species")
-        index_task = self.new_task("ref_index", CreateIndexForContamRemoval)
-        decontam_task = self.new_task("decontam", ContaminantRemoval)
+        if len(self.filter_genomes) > 0:
+            index_task = self.new_task("ref_index", CreateIndexForContamRemoval)
+            decontam_task = self.new_task("decontam", ContaminantRemoval)
 
         # Connecting outputs to inputs:
         sickle_task.in_fastq1 = input_task.out_fastq1
@@ -176,25 +193,40 @@ class SingleSampleWorkflow(sl.WorkflowTask):
 
         resync_task.in_fastq1 = sickle_task.out_fastq1
         resync_task.in_fastq2 = sickle_task.out_fastq2
-        resync_task.ref = index_task.out_put
 
-        decontam_task.in_fastq1 = resync_task.out_fastq1
-        decontam_task.in_fastq2 = resync_task.out_fastq2
+        end_tasks = [fastqc_task_after, fastqc_task_before, metaphlan_task]
 
-        metaphlan_task.in_fastq1 = resync_task.out_fastq1
-        metaphlan_task.in_fastq2 = resync_task.out_fastq2
+        if len(self.filter_genomes) > 0:
+            decontam_task.ref = index_task.out_put
+            decontam_task.in_fastq1 = resync_task.out_fastq1
+            decontam_task.in_fastq2 = resync_task.out_fastq2
 
-        midas_task.in_fastq1 = resync_task.out_fastq1
-        midas_task.in_fastq2 = resync_task.out_fastq2
+            metaphlan_task.in_fastq1 = decontam_task.out_fastq1
+            metaphlan_task.in_fastq2 = decontam_task.out_fastq2
 
+            midas_task.in_fastq1 = decontam_task.out_fastq1
+            midas_task.in_fastq2 = decontam_task.out_fastq2
+
+            end_tasks.append(index_task)
+        else:
+            metaphlan_task.in_fastq1 = resync_task.out_fastq1
+            metaphlan_task.in_fastq2 = resync_task.out_fastq2
+
+            midas_task.in_fastq1 = resync_task.out_fastq1
+            midas_task.in_fastq2 = resync_task.out_fastq2
 
         # Return the last task(s) in the workflow chain.
-        return [fastqc_task_after, fastqc_task_before, metaphlan_task, midas_task]
+        return end_tasks
 
 
 class MultiSampleWorkflow(sl.WorkflowTask):
+    midas_db = sl.Parameter()
     dataset_description = sl.Parameter()
     working_dir = sl.Parameter()
+    contaminant_removal_method = sl.Parameter(default="bbsplit")
+    filter_genomes = luigi.ListParameter()
+    ref_info_dir = sl.Parameter()
+    ref_combo_hash = sl.Parameter()
 
     def workflow(self):
         dataset_spec = json.load(self.dataset_description)
@@ -247,15 +279,15 @@ class TrimReads(sl.Task, AutoPairedFastq):
                 out1=self.out_fastq1().path,
                 out2=self.out_fastq2().path))
         elif self.method == "fastq-mcf":
-            pass # TODO: Add fastq-mcf
+            pass  # TODO: Add fastq-mcf
         elif self.method == "bbduk":
             self.ex('bbduk.sh in="{reads1}" in2="{reads2}" '
                     'out="{out1}" out2="{out2}" ref=adapters,phix stats="{outstats}'.format(
-                reads1=self.in_fastq1().path,
-                reads2=self.in_fastq2().path,
-                out1=self.out_fastq1().path,
-                out2=self.out_fastq2().path,
-                outstats=os.path.join(os.path.dirname(self.out_fastq2().path),"stats.txt")))
+                        reads1=self.in_fastq1().path,
+                        reads2=self.in_fastq2().path,
+                        out1=self.out_fastq1().path,
+                        out2=self.out_fastq2().path,
+                        outstats=os.path.join(os.path.dirname(self.out_fastq2().path), "stats.txt")))
         else:
             raise_(ValueError, "Unimplemented trimming method chosen", traceback)
 
@@ -265,39 +297,39 @@ class CreateIndexForContamRemoval(sl.Task, AutoSentinel):
     def run(self):
         method = self.workflow_task.contaminant_removal_method
         output = self.out_put()
-        outdir = os.path.dirname(output)
+        outdir = os.path.dirname(output.path)
         # Location of either existing ref data with subdirs per method. Must have trailing slash:
-        ref_dir_for_wf = os.path.join(self.workflow_task.ref_info_subdir, self.workflow_task.ref_combo_hash, method, "")
+        ref_dir_for_wf = os.path.join(self.workflow_task.ref_info_dir, self.workflow_task.ref_combo_hash, method, "")
 
         # If the given ref dir has necessary indices, just symlink them to the local dir
         if not os.path.exists(ref_dir_for_wf):
+            # TODO: check more robustly that index actually exists
             output.target.fs.mkdir(ref_dir_for_wf)
-             # Else make them
+            # Else make them
             if method == "bbsplit":
-                    self.ex("bbsplit.sh ref={genome} path={path}".format(
-                        genome=",".join(self.workflow_task.filter_genomes),
-                        path=ref_dir_for_wf
-                    ))
+                self.ex("bbsplit.sh ref={genome} path={path}".format(
+                    genome=",".join(self.workflow_task.filter_genomes),
+                    path=ref_dir_for_wf
+                ))
             elif method == "bowtie2":
                 self.ex("bowtie2-build {genome} {path}".format(
-                            genome=",".join(self.workflow_task.filter_genomes),
-                            path=ref_dir_for_wf)
+                    genome=",".join(self.workflow_task.filter_genomes),
+                    path=ref_dir_for_wf)
                 )
-        os.symlink(os.path.join(self.workflow_task.ref_info_subdir, self.workflow_task.ref_combo_hash),
-                   outdir, target_is_directory=True)
+        output.target.fs.mkdir(outdir)
+        os.symlink(os.path.abspath(ref_dir_for_wf), os.path.join(outdir, method))
         with output.open("w") as fp:
             self.log_info(fp)
 
 
 class ContaminantRemoval(sl.Task, AutoPairedFastq, AutoTxt):
-    # TODO: finish implementing dependency on index being made beforehand
     in_fastq1 = None
     in_fastq2 = None
-    ref = None # Ref is the sentinel file that lives in the dir created via symlink pointing at ref dirs for each method
+    ref = None  # Ref is the sentinel file that is in the dir created via symlink pointing at ref dirs for each method
 
     def run(self):
-        method = self.workflow_task.self.workflow_task.contaminant_removal_method
-        ref_dir = os.path.join(os.path.dirname(self.ref().path), method, "") # Again have to ensure trailing slash
+        method = self.workflow_task.contaminant_removal_method
+        ref_dir = os.path.join(os.path.dirname(self.ref().path), method, "")  # Again have to ensure trailing slash
         outtxt = self.out_put()
         outdir = os.path.dirname(self.out_fastq1().path)
 
@@ -307,15 +339,15 @@ class ContaminantRemoval(sl.Task, AutoPairedFastq, AutoTxt):
                     {out}/tmp%.fq.gz > /dev/null 2>{log};"
                     "mv {out}/tmp1.fq.gz {out1};"
                     "mv {out}/tmp1.fq.gz {out2}".format(
-                    reads1=self.in_fastq1().path,
-                    reads2=self.in_fastq2().path,
-                    out=outdir,
-                    ref=ref_dir,
-                    out1=self.out_fastq1(),
-                    out2=self.out_fastq2(),
-                    log=outtxt.path,
-                    sample=self.workflow_task.prefix
-            ))
+                        reads1=self.in_fastq1().path,
+                        reads2=self.in_fastq2().path,
+                        out=outdir,
+                        ref=ref_dir,
+                        out1=self.out_fastq1(),
+                        out2=self.out_fastq2(),
+                        log=outtxt.path,
+                        sample=self.workflow_task.prefix
+                    ))
 
         elif method == "bbsplit":
 
@@ -336,8 +368,7 @@ class ContaminantRemoval(sl.Task, AutoPairedFastq, AutoTxt):
                 out2=self.out_fastq2().path,
                 path=ref_dir,
                 log=outtxt.path,
-            )
-            )
+            ))
         else:
             raise_(ValueError, "Unimplemented host removal method chosen", traceback)
 
@@ -396,9 +427,10 @@ class RunMIDAS(sl.Task, AutoSentinel):
         self.ex('''
         run_midas.py {subtask} \
         {outdir} \
+        -d \
         -1 {in1} \
         -2 {in2} \
-        -t {nproc}
+        -t {nproc} --remove_temp
         '''.format(
             subtask=self.midas_subtask,
             outdir=outdir,
@@ -412,14 +444,26 @@ class RunMIDAS(sl.Task, AutoSentinel):
 
 if __name__ == '__main__':
     arguments = docopt(__doc__)
-    if not arguments["--midas_dir"]:
-        arguments["--midas_dir"] = os.getenv("MIDAS_DB")
-    if not arguments["--midas_dir"]:
-       raise_(ValueError, "Need to provide location of MIDAS_DB (or set it as an env var)", traceback)
-    log.debug(str(arguments))
+    if not arguments["--midas_db"]:
+        arguments["--midas_db"] = os.getenv("MIDAS_DB")
+    if not arguments["--midas_db"]:
+        raise_(ValueError, "Need to provide location of MIDAS_DB (or set it as an env var)", traceback)
+
+    if not arguments["--ref_data_dir"]:
+        arguments["--ref_data_dir"] = os.path.join(arguments["<working_dir>"], "ref_data")
+
+    if len(arguments["--genome_to_filter"]) > 0:
+        ref_hash = get_md5_of_unordered_fileset(arguments["--genome_to_filter"])
+    else:
+        ref_hash = None
+    log.info(str(arguments))
 
     luigi.run(local_scheduler=True, main_task_cls=SingleSampleWorkflow,
               cmdline_args=['--scheduler-host=localhost',
-                            f'--workdir={arguments["<working_dir>"]}',
-                            f'--prefix={arguments["<prefix>"]}']
+                            '--workdir={}'.format(arguments["<working_dir>"]),
+                            '--prefix={}'.format(arguments["<prefix>"]),
+                            '--midas-db={}'.format(arguments["--midas_db"]),
+                            '--ref-info-dir={}'.format(arguments["--ref_data_dir"]),
+                            '--ref-combo-hash={}'.format(ref_hash),
+                            '--filter-genomes={}'.format(json.dumps(arguments["--genome_to_filter"]))]
               )
