@@ -1,17 +1,22 @@
 # coding=utf-8
 """
 A basic metagenomics workflow using SciLuigi.
+For now runs on one sample, requiring the location of the working dir, the prefix for the sample, and the path to the
+forward and reverse reads. This is a temporary solution.
+If filtering for host contamination is requires, multiple references can be provided by just repeating the
+--genome-to-filter option on the commandline with different files
 
-Usage: workflow.py <working_dir> <prefix>
-    [--midas_db=<midas_db_path>] [--ref_data_dir=<ref_dir>] [--genome_to_filter=<human.fa>]...
+Usage: workflow.py <working_dir> <prefix> <in_fastq1> <in_fastq2>
+    [--midas-db=<midas_db_path>] [--ref-data-dir=<ref_dir>] [--genome-to-filter=<human.fa>]...
+    [--fastqmcf=<fastqmcf_executable>]
 
 
 Options:
---midas_db=<midas_db_path>     Location of the MIDAS database
---ref_data_dir=<ref_dir>       Location of where precomputed indices for filtering may exist.
-                               If they don't, they'll be created
---genome_to_filter=<human.fa>  Can be specified multiple times to filter against multiple fastas
-
+--midas-db=<midas_db_path>        Location of the MIDAS database
+--ref-data-dir=<ref_dir>          Location of where precomputed indices for filtering may exist.
+                                  If they don't, they'll be created
+--genome-to-filter=<human.fa>     Can be specified multiple times to filter against multiple fastas
+--fastqmcf=<fastqmcf_executable>  Point to fasqtmcf binary if it's not on your PATH
 
 """
 
@@ -50,6 +55,12 @@ def get_md5(filepath):
 
 
 def get_md5_of_unordered_fileset(list_of_filepaths):
+    """
+    Given a list of files (in or case genomes we want to filter), want to compute a hash
+    that characterizes the entire group
+    :param list_of_filepaths: list with valid file locations we want to characterize as a collection
+    :return: hash of sorted individual file hashes
+    """
     hashes = [get_md5(filepath) for filepath in list_of_filepaths]
     return hashlib.md5(";".join(sorted(hashes)).encode('utf-8')).hexdigest()
 
@@ -149,6 +160,11 @@ class AutoPairedFastq(AutoOutput):
 
 
 class SingleSampleWorkflow(sl.WorkflowTask):
+    """
+    This workflow runs a series of NGS tools for one sample
+    """
+    in_fastq1 = sl.Parameter()
+    in_fastq2 = sl.Parameter()
     midas_db = sl.Parameter()
     workdir = sl.Parameter()
     prefix = sl.Parameter()
@@ -164,12 +180,12 @@ class SingleSampleWorkflow(sl.WorkflowTask):
     #             "/pollard/home/slyalina/work/reference/masked_genomes_for_filtering/hg19_main_mask_ribo_animal_allplant_allfungus.fa.gz",
     #             "/pollard/home/slyalina/work/reference/masked_genomes_for_filtering/mouse_masked.fa.gz"])
 
-
     def workflow(self):
-
         # Initialize tasks:
         input_task = self.new_task("input", Input,
-                                   prefix=self.prefix)
+                                   prefix=self.prefix,
+                                   in_fastq1=self.in_fastq1,
+                                   in_fastq2=self.in_fastq2)
         fastqc_task_before = self.new_task('fastQC_before', Fastqc)
         sickle_task = self.new_task('sickle', TrimReads)
         fastqc_task_after = self.new_task('fastQC_after', Fastqc)
@@ -220,9 +236,12 @@ class SingleSampleWorkflow(sl.WorkflowTask):
 
 
 class MultiSampleWorkflow(sl.WorkflowTask):
+    """
+    This workflow is meant to take an entire dataset description and run the the SingleSampleWorkflow on each sample
+    """
     midas_db = sl.Parameter()
     dataset_description = sl.Parameter()
-    working_dir = sl.Parameter()
+    workdir = sl.Parameter()
     contaminant_removal_method = sl.Parameter(default="bbsplit")
     filter_genomes = luigi.ListParameter()
     ref_info_dir = sl.Parameter()
@@ -231,23 +250,42 @@ class MultiSampleWorkflow(sl.WorkflowTask):
     def workflow(self):
         dataset_spec = json.load(self.dataset_description)
         tasks = []
+        if len(self.filter_genomes) > 0:
+            index_task = self.new_task("ref_index", CreateIndexForContamRemoval)
+        tasks.append(index_task)
+        # Samples are in an array in the json. Each sample has a prefix and two read files
         for sample in dataset_spec["samples"]:
-            wf = self.new_task('SampleWorkflow', SingleSampleWorkflow,
-                               working_dir=self.working_dir,
-                               prefix=sample["prefix"])
+            wf = self.new_task('SampleWorkflow_' + sample["prefix"], SingleSampleWorkflow,
+                               workdir=self.workdir,
+                               prefix=sample["prefix"],
+                               in_fastq1=sample["in_fastq1"],
+                               in_fastq2=sample["in_fastq2"],
+                               midas_db=self.midas_db,
+                               filter_genomes=self.filter_genomes,
+                               ref_info_dir=self.ref_info_dir,
+                               ref_combo_hash=self.ref_combo_hash)
             tasks.append(wf)
         return tasks
 
 
-class Input(sl.ExternalTask):
+class Input(sl.Task):
+    in_fastq1 = sl.Parameter()
+    in_fastq2 = sl.Parameter()
 
     def out_fastq1(self):
         return sl.TargetInfo(self, os.path.join(str(self.workflow_task.workdir),
+                                                "input_reads",
                                                 str(self.workflow_task.prefix) + "_1.fq.gz"))
 
     def out_fastq2(self):
         return sl.TargetInfo(self, os.path.join(str(self.workflow_task.workdir),
+                                                "input_reads",
                                                 str(self.workflow_task.prefix) + "_2.fq.gz"))
+
+    def run(self):
+        self.out_fastq1().target.fs.mkdir(os.path.dirname(self.out_fastq1().path))
+        os.symlink(os.path.abspath(self.in_fastq1), self.out_fastq1().path)
+        os.symlink(os.path.abspath(self.in_fastq2), self.out_fastq2().path)
 
 
 class Fastqc(sl.Task, AutoSentinel):
@@ -302,8 +340,18 @@ class CreateIndexForContamRemoval(sl.Task, AutoSentinel):
         ref_dir_for_wf = os.path.join(self.workflow_task.ref_info_dir, self.workflow_task.ref_combo_hash, method, "")
 
         # If the given ref dir has necessary indices, just symlink them to the local dir
-        if not os.path.exists(ref_dir_for_wf):
-            # TODO: check more robustly that index actually exists
+        need_to_build = not os.path.exists(ref_dir_for_wf)
+        if not need_to_build:
+            if method == "bbsplit":
+                # Check if the usual subdirs exist and if they have some nontrivial-sized content
+                index_loc = os.path.exists(os.path.join(ref_dir_for_wf, "ref", "index", "1"))
+                need_to_build = not os.path.exists(index_loc)
+                if not need_to_build:
+                    need_to_build = sum(os.path.getsize(f) for f in os.listdir(index_loc) if os.path.isfile(f)) < 5*1024
+            elif method == "bowtie2":
+                need_to_build = sum(os.path.getsize(f) for f in os.listdir(ref_dir_for_wf) if os.path.isfile(f)) < 5*1024
+
+        if need_to_build:
             output.target.fs.mkdir(ref_dir_for_wf)
             # Else make them
             if method == "bbsplit":
@@ -444,16 +492,16 @@ class RunMIDAS(sl.Task, AutoSentinel):
 
 if __name__ == '__main__':
     arguments = docopt(__doc__)
-    if not arguments["--midas_db"]:
-        arguments["--midas_db"] = os.getenv("MIDAS_DB")
-    if not arguments["--midas_db"]:
+    if not arguments["--midas-db"]:
+        arguments["--midas-db"] = os.getenv("MIDAS_DB")
+    if not arguments["--midas-db"]:
         raise_(ValueError, "Need to provide location of MIDAS_DB (or set it as an env var)", traceback)
 
-    if not arguments["--ref_data_dir"]:
-        arguments["--ref_data_dir"] = os.path.join(arguments["<working_dir>"], "ref_data")
+    if not arguments["--ref-data-dir"]:
+        arguments["--ref-data-dir"] = os.path.join(arguments["<working_dir>"], "ref_data")
 
-    if len(arguments["--genome_to_filter"]) > 0:
-        ref_hash = get_md5_of_unordered_fileset(arguments["--genome_to_filter"])
+    if len(arguments["--genome-to-filter"]) > 0:
+        ref_hash = get_md5_of_unordered_fileset(arguments["--genome-to-filter"])
     else:
         ref_hash = None
     log.info(str(arguments))
@@ -462,8 +510,10 @@ if __name__ == '__main__':
               cmdline_args=['--scheduler-host=localhost',
                             '--workdir={}'.format(arguments["<working_dir>"]),
                             '--prefix={}'.format(arguments["<prefix>"]),
-                            '--midas-db={}'.format(arguments["--midas_db"]),
-                            '--ref-info-dir={}'.format(arguments["--ref_data_dir"]),
+                            '--in-fastq1={}'.format(arguments["<in_fastq1>"]),
+                            '--in-fastq2={}'.format(arguments["<in_fastq2>"]),
+                            '--midas-db={}'.format(arguments["--midas-db"]),
+                            '--ref-info-dir={}'.format(arguments["--ref-data-dir"]),
                             '--ref-combo-hash={}'.format(ref_hash),
-                            '--filter-genomes={}'.format(json.dumps(arguments["--genome_to_filter"]))]
+                            '--filter-genomes={}'.format(json.dumps(arguments["--genome-to-filter"]))]
               )
